@@ -88,48 +88,35 @@ class PostManager:
                 file_id = message.photo[-1].file_id
             elif message.video:
                 file_id = message.video.file_id
-            elif message.document:
-                file_id = message.document.file_id
-            elif message.audio:
-                file_id = message.audio.file_id
 
-            # Определяем caption
-            caption = message.caption if message.caption else ""
-            if message.text and not message.caption:
-                caption = message.text
+            # Для медиагрупп сохраняем caption только из первого сообщения
+            caption = None
+            if not message.media_group_id or (message.caption or message.text):
+                caption = message.caption if message.caption else ""
+                if message.text and not message.caption:
+                    caption = message.text
 
-            # Для медиагрупп сначала проверяем существующую запись
-            if message.media_group_id:
-                cursor.execute('SELECT file_ids FROM posts WHERE media_group_id = ?', (media_group_id,))
-                existing = cursor.fetchone()
+            # Проверяем существующую запись
+            cursor.execute('SELECT file_ids, caption FROM posts WHERE media_group_id = ?', (media_group_id,))
+            existing = cursor.fetchone()
 
-                if existing:
-                    # Обновляем существующую запись
-                    file_ids = json.loads(existing[0])
-                    if file_id and file_id not in file_ids:
-                        file_ids.append(file_id)
+            if existing:
+                # Обновляем существующую запись
+                existing_file_ids = json.loads(existing[0]) if existing[0] else []
+                existing_caption = existing[1] if existing[1] else ""
 
-                    cursor.execute('''
-                        UPDATE posts 
-                        SET file_ids = ?, caption = ?
-                        WHERE media_group_id = ?
-                    ''', (json.dumps(file_ids), caption, media_group_id))
-                else:
-                    # Создаем новую запись для медиагруппы
-                    file_ids = [file_id] if file_id else []
-                    cursor.execute('''
-                        INSERT INTO posts 
-                        (original_message_id, media_group_id, file_ids, caption, post_date)
-                        VALUES (?, ?, ?, ?, ?)
-                    ''', (
-                        message.message_id,
-                        media_group_id,
-                        json.dumps(file_ids),
-                        caption,
-                        datetime.now().isoformat()
-                    ))
+                if file_id and file_id not in existing_file_ids:
+                    existing_file_ids.append(file_id)
+
+                # Обновляем caption только если его еще нет
+                update_caption = existing_caption if existing_caption else caption
+                cursor.execute('''
+                    UPDATE posts 
+                    SET file_ids = ?, caption = ?
+                    WHERE media_group_id = ?
+                ''', (json.dumps(existing_file_ids), update_caption, media_group_id))
             else:
-                # Одиночные сообщения
+                # Создаем новую запись
                 file_ids = [file_id] if file_id else []
                 cursor.execute('''
                     INSERT INTO posts 
@@ -144,7 +131,8 @@ class PostManager:
                 ))
 
             conn.commit()
-            logger.info(f"Сохранен пост {message.message_id}, группа {media_group_id}, файлов: {len(file_ids)}")
+            logger.info(
+                f"Сохранен пост {message.message_id}, группа {media_group_id}, файлов: {len(file_ids) if 'file_ids' in locals() else 1}, caption: '{caption}'")
 
         except Exception as e:
             logger.error(f"Ошибка сохранения поста {message.message_id}: {e}")
@@ -295,15 +283,17 @@ async def process_pending_posts(app: Application):
             try:
                 # Берем первый пост группы для получения caption
                 main_post = posts[0]
-                caption = main_post['caption'] or ""
-                full_caption = f"{caption}{ADDITIONAL_TEXT}" if caption else ADDITIONAL_TEXT.strip()
+                original_caption = main_post['caption'] or ""
+
+                # Формируем полную подпись
+                full_caption = f"{original_caption}\n\n{ADDITIONAL_TEXT}" if original_caption else ADDITIONAL_TEXT
 
                 # Собираем все file_ids из группы
                 all_file_ids = []
                 for post in posts:
                     all_file_ids.extend(post['file_ids'])
 
-                logger.info(f"Обработка группы {media_group_id} с {len(all_file_ids)} файлами")
+                logger.info(f"Обработка группы {media_group_id}, оригинальный текст: '{original_caption}'")
 
                 # Текстовое сообщение
                 if not all_file_ids:
@@ -318,13 +308,8 @@ async def process_pending_posts(app: Application):
                         msg = await bot.send_photo(
                             chat_id=TARGET_CHANNEL_ID,
                             photo=file_id,
-                            caption=full_caption
-                        )
-                    elif file_id.startswith('BAAC'):
-                        msg = await bot.send_video(
-                            chat_id=TARGET_CHANNEL_ID,
-                            video=file_id,
-                            caption=full_caption
+                            caption=full_caption,
+                            parse_mode="Markdown"
                         )
                 # Медиагруппа
                 else:
@@ -333,12 +318,14 @@ async def process_pending_posts(app: Application):
                         if file_id.startswith('AgAC'):
                             media = InputMediaPhoto(
                                 media=file_id,
-                                caption=full_caption if i == 0 else None
+                                caption=full_caption if i == 0 else None,
+                                parse_mode="Markdown"
                             )
                         elif file_id.startswith('BAAC'):
                             media = InputMediaVideo(
                                 media=file_id,
-                                caption=full_caption if i == 0 else None
+                                caption=full_caption if i == 0 else None,
+                                parse_mode="Markdown"
                             )
                         else:
                             continue
@@ -346,7 +333,7 @@ async def process_pending_posts(app: Application):
                         media_group.append(media)
 
                     if media_group:
-                        logger.info(f"Отправка медиагруппы из {len(media_group)} элементов")
+                        logger.info(f"Отправка медиагруппы из {len(media_group)} элементов с текстом: '{full_caption}'")
                         try:
                             messages = await bot.send_media_group(
                                 chat_id=TARGET_CHANNEL_ID,
