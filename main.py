@@ -4,7 +4,7 @@ import sys
 from typing import Dict, List
 from datetime import datetime
 from dotenv import load_dotenv
-from telegram import Bot, Update, Message
+from telegram import Bot, Update, Message, InputMediaPhoto, InputMediaVideo
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 import logging
 from logger_config import setup_logging
@@ -82,13 +82,6 @@ class PostManager:
 
             media_group_id = message.media_group_id or str(message.message_id)
 
-            # Для медиагрупп сохраняем только один раз
-            if message.media_group_id:
-                cursor.execute('SELECT 1 FROM posts WHERE media_group_id = ?', (media_group_id,))
-                if cursor.fetchone():
-                    logger.info(f"Пропускаем дубликат медиагруппы {media_group_id}")
-                    return
-
             # Получаем file_id для текущего медиа
             file_id = None
             if message.photo:
@@ -100,32 +93,44 @@ class PostManager:
             elif message.audio:
                 file_id = message.audio.file_id
 
-            # Для медиагрупп собираем все file_ids
-            file_ids = []
-            if message.media_group_id:
-                cursor.execute('SELECT file_ids FROM posts WHERE media_group_id = ?', (media_group_id,))
-                existing = cursor.fetchone()
-                if existing and existing[0]:
-                    file_ids = json.loads(existing[0])
-                if file_id:
-                    file_ids.append(file_id)
-            elif file_id:
-                file_ids = [file_id]
-
             # Определяем caption
             caption = message.caption if message.caption else ""
             if message.text and not message.caption:
                 caption = message.text
 
-            # Сохраняем или обновляем запись
-            if message.media_group_id and cursor.execute('SELECT 1 FROM posts WHERE media_group_id = ?',
-                                                         (media_group_id,)).fetchone():
-                cursor.execute('''
-                    UPDATE posts 
-                    SET file_ids = ?
-                    WHERE media_group_id = ?
-                ''', (json.dumps(file_ids), media_group_id))
+            # Для медиагрупп сначала проверяем существующую запись
+            if message.media_group_id:
+                cursor.execute('SELECT file_ids FROM posts WHERE media_group_id = ?', (media_group_id,))
+                existing = cursor.fetchone()
+
+                if existing:
+                    # Обновляем существующую запись
+                    file_ids = json.loads(existing[0])
+                    if file_id and file_id not in file_ids:
+                        file_ids.append(file_id)
+
+                    cursor.execute('''
+                        UPDATE posts 
+                        SET file_ids = ?, caption = ?
+                        WHERE media_group_id = ?
+                    ''', (json.dumps(file_ids), caption, media_group_id))
+                else:
+                    # Создаем новую запись для медиагруппы
+                    file_ids = [file_id] if file_id else []
+                    cursor.execute('''
+                        INSERT INTO posts 
+                        (original_message_id, media_group_id, file_ids, caption, post_date)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (
+                        message.message_id,
+                        media_group_id,
+                        json.dumps(file_ids),
+                        caption,
+                        datetime.now().isoformat()
+                    ))
             else:
+                # Одиночные сообщения
+                file_ids = [file_id] if file_id else []
                 cursor.execute('''
                     INSERT INTO posts 
                     (original_message_id, media_group_id, file_ids, caption, post_date)
@@ -148,7 +153,6 @@ class PostManager:
         finally:
             if conn:
                 conn.close()
-
 
     @staticmethod
     def get_unprocessed_posts() -> List[Dict]:
@@ -243,42 +247,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик входящих сообщений"""
     try:
         message = update.effective_message
-        logger.info(f"Получено сообщение: {message.message_id}")
 
         if message.chat.id != SOURCE_CHANNEL_ID:
-            logger.warning(f"Сообщение из неправильного чата: {message.chat.id}")
             return
 
-        # Логируем тип контента
-        content_types = []
-        if message.photo: content_types.append("photo")
-        if message.video: content_types.append("video")
-        if message.document: content_types.append("document")
-        if message.audio: content_types.append("audio")
-        if message.caption: content_types.append("caption")
-        if message.text: content_types.append("text")
-
-        logger.info(f"Типы контента: {', '.join(content_types) or 'нет'}")
-
-        if not any([message.photo, message.video, message.document, message.audio, message.caption, message.text]):
-            logger.warning("Сообщение без поддерживаемого контента")
+        # Для медиагрупп - обрабатываем все сообщения, даже без ключевых слов
+        if message.media_group_id:
+            logger.info(f"Получено сообщение медиагруппы: {message.message_id}")
+            PostManager.save_post(message)
             return
 
-        keyword_found = False
-        if message.caption:
-            logger.info(f"Подпись: {message.caption}")
-            if any(keyword.lower() in message.caption.lower() for keyword in KEYWORDS):
-                keyword_found = True
-        elif message.text:
-            logger.info(f"Текст: {message.text}")
-            if any(keyword.lower() in message.text.lower() for keyword in KEYWORDS):
-                keyword_found = True
+        # Для обычных сообщений проверяем ключевые слова
+        has_keyword = False
+        if message.caption and any(keyword.lower() in message.caption.lower() for keyword in KEYWORDS):
+            has_keyword = True
+        elif message.text and any(keyword.lower() in message.text.lower() for keyword in KEYWORDS):
+            has_keyword = True
 
-        if keyword_found:
+        if has_keyword:
             logger.info(f"Найден пост с ключевым словом: {message.message_id}")
             PostManager.save_post(message)
         else:
-            logger.info("Ключевые слова не найдены")
+            logger.info("Ключевые слова не найдены, пропускаем сообщение")
 
     except Exception as e:
         logger.error(f"Ошибка в handle_message: {e}", exc_info=True)
@@ -289,26 +279,41 @@ async def process_pending_posts(app: Application):
     try:
         logger.info("Запуск проверки отложенных постов...")
         unprocessed_posts = PostManager.get_unprocessed_posts()
-        logger.info(f"Найдено {len(unprocessed_posts)} необработанных постов")
+
+        # Группируем по media_group_id
+        grouped_posts = {}
+        for post in unprocessed_posts:
+            if post['media_group_id'] not in grouped_posts:
+                grouped_posts[post['media_group_id']] = []
+            grouped_posts[post['media_group_id']].append(post)
+
+        logger.info(f"Найдено {len(grouped_posts)} групп постов для обработки")
 
         bot = app.bot
 
-        for post in unprocessed_posts:
+        for media_group_id, posts in grouped_posts.items():
             try:
-                caption = post['caption'] or ""
+                # Берем первый пост группы для получения caption
+                main_post = posts[0]
+                caption = main_post['caption'] or ""
                 full_caption = f"{caption}{ADDITIONAL_TEXT}" if caption else ADDITIONAL_TEXT.strip()
 
-                logger.info(f"Обработка поста {post['media_group_id']} с {len(post['file_ids'])} файлами")
+                # Собираем все file_ids из группы
+                all_file_ids = []
+                for post in posts:
+                    all_file_ids.extend(post['file_ids'])
+
+                logger.info(f"Обработка группы {media_group_id} с {len(all_file_ids)} файлами")
 
                 # Текстовое сообщение
-                if not post['file_ids']:
+                if not all_file_ids:
                     msg = await bot.send_message(
                         chat_id=TARGET_CHANNEL_ID,
                         text=full_caption
                     )
                 # Одиночное медиа
-                elif len(post['file_ids']) == 1:
-                    file_id = post['file_ids'][0]
+                elif len(all_file_ids) == 1:
+                    file_id = all_file_ids[0]
                     if file_id.startswith('AgAC'):
                         msg = await bot.send_photo(
                             chat_id=TARGET_CHANNEL_ID,
@@ -324,39 +329,47 @@ async def process_pending_posts(app: Application):
                 # Медиагруппа
                 else:
                     media_group = []
-                    for i, file_id in enumerate(post['file_ids']):
-                        media_type = 'photo' if file_id.startswith('AgAC') else 'video'
-                        media = {
-                            'type': media_type,
-                            'media': file_id
-                        }
-                        # Добавляем caption только к первому медиа
-                        if i == 0 and full_caption:
-                            media['caption'] = full_caption
+                    for i, file_id in enumerate(all_file_ids):
+                        if file_id.startswith('AgAC'):
+                            media = InputMediaPhoto(
+                                media=file_id,
+                                caption=full_caption if i == 0 else None
+                            )
+                        elif file_id.startswith('BAAC'):
+                            media = InputMediaVideo(
+                                media=file_id,
+                                caption=full_caption if i == 0 else None
+                            )
+                        else:
+                            continue
+
                         media_group.append(media)
 
-                    logger.info(f"Отправка медиагруппы из {len(media_group)} элементов")
-                    try:
-                        messages = await bot.send_media_group(
-                            chat_id=TARGET_CHANNEL_ID,
-                            media=media_group
-                        )
-                        msg = messages[0] if messages else None
-                    except Exception as e:
-                        logger.error(f"Ошибка отправки медиагруппы: {e}")
-                        continue
+                    if media_group:
+                        logger.info(f"Отправка медиагруппы из {len(media_group)} элементов")
+                        try:
+                            messages = await bot.send_media_group(
+                                chat_id=TARGET_CHANNEL_ID,
+                                media=media_group
+                            )
+                            msg = messages[0] if messages else None
+                        except Exception as e:
+                            logger.error(f"Ошибка отправки медиагруппы: {e}")
+                            continue
 
                 if msg:
-                    PostManager.mark_as_processed(post['media_group_id'], msg.message_id)
-                    logger.info(f"Пост {post['media_group_id']} успешно переслан")
+                    for post in posts:
+                        PostManager.mark_as_processed(post['media_group_id'], msg.message_id)
+                    logger.info(f"Группа {media_group_id} успешно переслана")
                 else:
-                    logger.error("Не удалось отправить сообщение")
+                    logger.error(f"Не удалось отправить группу {media_group_id}")
 
             except Exception as e:
-                logger.error(f"Ошибка пересылки поста {post['media_group_id']}: {e}")
+                logger.error(f"Ошибка пересылки группы {media_group_id}: {e}")
 
     except Exception as e:
         logger.error(f"Ошибка process_pending_posts: {e}")
+
 
 
 async def run_bot():
@@ -430,6 +443,33 @@ async def run_periodic_check(app: Application):
         except Exception as e:
             logger.error(f"Ошибка в периодической проверке: {e}")
             await asyncio.sleep(5)  # Задержка при ошибке
+
+
+@staticmethod
+def check_media_groups():
+    """Проверяет целостность медиагрупп в базе"""
+    try:
+        conn = sqlite3.connect('posts.db')
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT media_group_id, COUNT(*) as cnt 
+            FROM posts 
+            WHERE media_group_id NOT LIKE '%-%' 
+            GROUP BY media_group_id 
+            HAVING cnt > 1
+        ''')
+
+        groups = cursor.fetchall()
+        logger.info(f"Найдено {len(groups)} медиагрупп в базе:")
+        for group_id, count in groups:
+            logger.info(f"Группа {group_id}: {count} элементов")
+
+    except Exception as e:
+        logger.error(f"Ошибка проверки медиагрупп: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 
 def main():
