@@ -4,12 +4,14 @@ import sys
 from typing import Dict, List
 from datetime import datetime
 from dotenv import load_dotenv
-from telegram import Bot, Update, Message, InputMediaPhoto, InputMediaVideo, InputMediaDocument
+from telegram import Update, Message, InputMediaPhoto, InputMediaVideo, InputMediaDocument
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 import logging
 from logger_config import setup_logging
 import sqlite3
 import json
+from config import DELAY_MINUTES, ADDITIONAL_TEXT, KEYWORDS, CHECK_INTERVAL
+import pytz
 
 # Настройка логирования
 setup_logging()
@@ -20,12 +22,6 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SOURCE_CHANNEL_ID = int(os.getenv("SOURCE_CHANNEL_ID"))
 TARGET_CHANNEL_ID = int(os.getenv("TARGET_CHANNEL_ID"))
-
-# Ключевые слова для фильтрации
-KEYWORDS = ["мужской", "для мужчин", "мужчины", "унисекс", "унисекс"]
-
-# Дополнительный текст для постов
-ADDITIONAL_TEXT = "\n\nДля заказа пишите сюда » срок доставки: 2-3 дня"
 
 
 # Инициализация базы данных
@@ -53,9 +49,35 @@ init_db()
 
 class PostManager:
     @staticmethod
+    def debug_unprocessed_posts():
+        """Экстренная проверка необработанных постов"""
+        try:
+            conn = sqlite3.connect('posts.db')
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                SELECT 
+                    media_group_id,
+                    post_date,
+                    datetime('now') as current_time,
+                    datetime(post_date) as post_date_conv,
+                    (strftime('%s','now') - strftime('%s',post_date)) as diff_seconds
+                FROM posts
+                WHERE is_processed = 0
+            ''')
+
+        except Exception as e:
+            logger.error(f"DEBUG ошибка: {e}")
+        finally:
+            conn.close()
+
+    @staticmethod
     def _get_connection():
-        """Создает и возвращает соединение с базой данных"""
-        return sqlite3.connect('posts.db')
+        """Возвращает безопасное подключение к БД"""
+        conn = sqlite3.connect('posts.db')
+        conn.execute("PRAGMA journal_mode=WAL")  # Улучшенная производительность
+        conn.execute("PRAGMA foreign_keys=ON")   # Включить внешние ключи
+        return conn
 
     @staticmethod
     def clear_db():
@@ -67,7 +89,7 @@ class PostManager:
             conn.commit()
             logger.warning("База данных очищена!")
         except Exception as e:
-            logger.error(f"Ошибка очистки БД: {e}")
+            logger.error(f"Ошибка очистки БД: {type(e).__name__}: {str(e)}", exc_info=True)
         finally:
             if conn:
                 conn.close()
@@ -107,8 +129,14 @@ class PostManager:
                     caption = message.text
 
             # Проверяем существующую запись
-            cursor.execute('SELECT file_ids, caption FROM posts WHERE media_group_id = ?', (media_group_id,))
+            cursor.execute('SELECT file_ids, caption FROM posts WHERE media_group_id = ?',
+                           (media_group_id,))
             existing = cursor.fetchone()
+
+            # Инициализируем file_ids, чтобы переменная всегда была определена
+            file_ids = []
+            if file_id:
+                file_ids.append(file_id)
 
             if existing:
                 # Обновляем существующую запись
@@ -117,6 +145,7 @@ class PostManager:
 
                 if file_id and file_id not in existing_file_ids:
                     existing_file_ids.append(file_id)
+                    file_ids = existing_file_ids
 
                 # Обновляем caption только если его еще нет
                 update_caption = existing_caption if existing_caption else caption
@@ -127,7 +156,6 @@ class PostManager:
                 ''', (json.dumps(existing_file_ids), update_caption, media_group_id))
             else:
                 # Создаем новую запись
-                file_ids = [file_id] if file_id else []
                 cursor.execute('''
                     INSERT INTO posts 
                     (original_message_id, media_group_id, file_ids, caption, post_date)
@@ -137,15 +165,17 @@ class PostManager:
                     media_group_id,
                     json.dumps(file_ids),
                     caption,
-                    datetime.now().isoformat()
+                    datetime.now(pytz.utc).strftime('%Y-%m-%d %H:%M:%S')
                 ))
 
             conn.commit()
             logger.info(
-                f"Сохранен пост {message.message_id}, группа {media_group_id}, файлов: {len(file_ids) if 'file_ids' in locals() else 1}, caption: '{caption}'")
+                f"Сохранен пост {message.message_id}, группа {media_group_id}, "
+                f"файлов: {len(file_ids) if 'file_ids' in locals() else 1}, caption: '{caption}'")
 
         except Exception as e:
-            logger.error(f"Ошибка сохранения поста {message.message_id}: {e}")
+            logger.error(f"Ошибка сохранения поста {message.message_id}: "
+                         f"{type(e).__name__}: {str(e)}", exc_info=True)
             if conn:
                 conn.rollback()
         finally:
@@ -159,7 +189,7 @@ class PostManager:
             conn = PostManager._get_connection()
             cursor = conn.cursor()
 
-            cursor.execute('''
+            cursor.execute(f'''
                 SELECT 
                     media_group_id,
                     file_ids,
@@ -167,6 +197,7 @@ class PostManager:
                     post_date
                 FROM posts
                 WHERE is_processed = 0
+                AND (strftime('%s','now') - strftime('%s',post_date)) >= {DELAY_MINUTES * 60}
                 ORDER BY post_date ASC
             ''')
 
@@ -188,7 +219,7 @@ class PostManager:
             return posts
 
         except Exception as e:
-            logger.error(f"Ошибка при получении постов: {e}", exc_info=True)
+            logger.error(f"Ошибка при получении постов: {type(e).__name__}: {str(e)}", exc_info=True)
             return []
         finally:
             if conn:
@@ -212,7 +243,7 @@ class PostManager:
             logger.info(f"Пост {media_group_id} помечен как обработанный")
 
         except Exception as e:
-            logger.error(f"Ошибка при обновлении поста: {e}", exc_info=True)
+            logger.error(f"Ошибка при обновлении поста: {type(e).__name__}: {str(e)}", exc_info=True)
             if conn:
                 conn.rollback()
         finally:
@@ -235,7 +266,7 @@ class PostManager:
                 logger.info(row)
 
         except Exception as e:
-            logger.error(f"Ошибка при чтении базы данных: {e}")
+            logger.error(f"Ошибка при чтении базы данных: {type(e).__name__}: {str(e)}", exc_info=True)
         finally:
             if conn:
                 conn.close()
@@ -269,10 +300,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info("Ключевые слова не найдены, пропускаем сообщение")
 
     except Exception as e:
-        logger.error(f"Ошибка в handle_message: {e}", exc_info=True)
+        logger.error(f"Ошибка в handle_message: {type(e).__name__}: {str(e)}", exc_info=True)
 
 
 async def process_pending_posts(app: Application):
+    PostManager.debug_unprocessed_posts()
     """Периодическая задача для обработки отложенных постов"""
     try:
         logger.info("Запуск проверки отложенных постов...")
@@ -303,7 +335,11 @@ async def process_pending_posts(app: Application):
                 for post in posts:
                     all_file_ids.extend(post['file_ids'])
 
-                logger.info(f"Обработка группы {media_group_id}, оригинальный текст: '{original_caption}'")
+                logger.info(
+                    f"Пересылка: group_id={media_group_id}, "
+                    f"files={len(all_file_ids)}, "
+                    f"text='{original_caption[:30]}...'"  # Логируем первые 30 символов
+                )
 
                 # Текстовое сообщение
                 if not all_file_ids:
@@ -311,7 +347,7 @@ async def process_pending_posts(app: Application):
                         chat_id=TARGET_CHANNEL_ID,
                         text=full_caption
                     )
-                # Одиночное медиа
+
                 # Одиночное медиа
                 elif len(all_file_ids) == 1:
                     msg = None  # Инициализируем переменную
@@ -354,7 +390,8 @@ async def process_pending_posts(app: Application):
 
                     except Exception as e:
                         file_id = all_file_ids[0]
-                        logger.error(f"Ошибка отправки файла {file_id[:10] if file_id else 'unknown'}: {e}")
+                        logger.error(f"Ошибка отправки файла {file_id[:10] if file_id else 'unknown'}: "
+                                     f"{type(e).__name__}: {str(e)}", exc_info=True)
 
                 # Медиагруппа
                 else:
@@ -391,7 +428,8 @@ async def process_pending_posts(app: Application):
                             )
                             msg = messages[0] if messages else None
                         except Exception as e:
-                            logger.error(f"Ошибка отправки медиагруппы: {e}")
+                            logger.error(f"Ошибка отправки медиагруппы: "
+                                         f"{type(e).__name__}: {str(e)}", exc_info=True)
 
                 if msg:
                     try:
@@ -401,16 +439,18 @@ async def process_pending_posts(app: Application):
                         else:
                             logger.error("Сообщение не было отправлено")
                     except Exception as e:
-                        logger.error(f"Ошибка при пометке поста: {e}")
+                        logger.error(f"Ошибка при пометке поста: "
+                                     f"{type(e).__name__}: {str(e)}", exc_info=True)
                     logger.info(f"Группа {media_group_id} успешно переслана")
                 else:
                     logger.error(f"Не удалось отправить группу {media_group_id}")
 
             except Exception as e:
-                logger.error(f"Ошибка пересылки группы {media_group_id}: {e}")
+                logger.error(f"Ошибка пересылки группы {media_group_id}: "
+                             f"{type(e).__name__}: {str(e)}", exc_info=True)
 
     except Exception as e:
-        logger.error(f"Ошибка process_pending_posts: {e}")
+        logger.error(f"Ошибка process_pending_posts: {type(e).__name__}: {str(e)}", exc_info=True)
 
 
 async def run_bot():
@@ -425,7 +465,7 @@ async def run_bot():
     try:
         app = Application.builder().token(BOT_TOKEN).build()
 
-        # Добавляем обработчик сообщений
+        # Обработчик сообщений
         app.add_handler(MessageHandler(
             filters.Chat(chat_id=SOURCE_CHANNEL_ID) & (
                     filters.PHOTO | filters.VIDEO | filters.Document.ALL |
@@ -441,6 +481,7 @@ async def run_bot():
         periodic_task = asyncio.create_task(run_periodic_check(app))
 
         logger.info("Бот запущен")
+        logger.info(f"Конфигурация: задержка={DELAY_MINUTES} мин, ключевые слова={KEYWORDS}")
         await app.start()
         await app.updater.start_polling()
 
@@ -451,7 +492,7 @@ async def run_bot():
     except asyncio.CancelledError:
         logger.info("Получен сигнал на завершение работы")
     except Exception as e:
-        logger.error(f"Ошибка при работе бота: {e}", exc_info=True)
+        logger.error(f"Ошибка при работе бота: {type(e).__name__}: {str(e)}", exc_info=True)
     finally:
         # Корректное завершение
         if periodic_task:
@@ -467,7 +508,7 @@ async def run_bot():
                 await app.stop()
                 await app.shutdown()
             except Exception as e:
-                logger.error(f"Ошибка при остановке бота: {e}")
+                logger.error(f"Ошибка при остановке бота: {type(e).__name__}: {str(e)}", exc_info=True)
 
         logger.info("Бот полностью остановлен")
 
@@ -477,12 +518,12 @@ async def run_periodic_check(app: Application):
     while True:
         try:
             await process_pending_posts(app)
-            await asyncio.sleep(10)  # Интервал проверки (10 секунд)
+            await asyncio.sleep(CHECK_INTERVAL * 60)  # Интервал проверки
         except asyncio.CancelledError:
             logger.info("Периодическая проверка остановлена")
             break
         except Exception as e:
-            logger.error(f"Ошибка в периодической проверке: {e}")
+            logger.error(f"Ошибка в периодической проверке: {type(e).__name__}: {str(e)}", exc_info=True)
             await asyncio.sleep(5)  # Задержка при ошибке
 
 
@@ -507,7 +548,7 @@ def check_media_groups():
             logger.info(f"Группа {group_id}: {count} элементов")
 
     except Exception as e:
-        logger.error(f"Ошибка проверки медиагрупп: {e}")
+        logger.error(f"Ошибка проверки медиагрупп: {type(e).__name__}: {str(e)}", exc_info=True)
     finally:
         if conn:
             conn.close()
@@ -515,13 +556,13 @@ def check_media_groups():
 
 def main():
     """Точка входа"""
-    PostManager.clear_db()
+    # PostManager.clear_db() # Очистка базы данных
     try:
         asyncio.run(run_bot())
     except KeyboardInterrupt:
         logger.info("Бот остановлен по запросу пользователя")
     except Exception as e:
-        logger.error(f"Критическая ошибка: {e}", exc_info=True)
+        logger.error(f"Критическая ошибка: {type(e).__name__}: {str(e)}", exc_info=True)
     finally:
         logging.shutdown()
 

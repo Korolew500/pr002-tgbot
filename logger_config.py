@@ -1,27 +1,33 @@
-# logger_config.py
 import logging
 from logging.handlers import RotatingFileHandler
+import time
 
 
 def setup_logging():
-    """Настройка логирования в файл и консоль"""
-    log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    """Настройка логирования с UTC-временем и ротацией файлов"""
+    formatter = logging.Formatter(
+        '[%(asctime)s UTC] %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    formatter.converter = time.gmtime  # Используем UTC время
 
-    # Настройка файлового обработчика
+    # Файловый обработчик (основные логи)
     file_handler = RotatingFileHandler(
         'bot.log',
-        maxBytes=5 * 1024 * 1024,  # 5 MB
+        maxBytes=5*1024*1024,  # 5 MB
         backupCount=3,
         encoding='utf-8'
     )
-    file_handler.setFormatter(log_formatter)
+    file_handler.setFormatter(formatter)
+    file_handler.setLevel(logging.INFO)
 
-    # Настройка консольного обработчика
+    # Консольный обработчик (только ошибки)
     console_handler = logging.StreamHandler()
-    console_handler.setFormatter(log_formatter)
+    console_handler.setFormatter(formatter)
+    console_handler.setLevel(logging.WARNING)
 
     # Основная настройка
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG,  # Минимальный уровень
         handlers=[file_handler, console_handler]
     )
