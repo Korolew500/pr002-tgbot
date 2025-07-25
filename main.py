@@ -4,7 +4,7 @@ import sys
 from typing import Dict, List
 from datetime import datetime
 from dotenv import load_dotenv
-from telegram import Bot, Update, Message, InputMediaPhoto, InputMediaVideo
+from telegram import Bot, Update, Message, InputMediaPhoto, InputMediaVideo, InputMediaDocument
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 import logging
 from logger_config import setup_logging
@@ -84,10 +84,20 @@ class PostManager:
 
             # Получаем file_id для текущего медиа
             file_id = None
+            file_type = None  # Добавляем переменную для типа файла
+
             if message.photo:
                 file_id = message.photo[-1].file_id
+                file_type = 'photo'
             elif message.video:
                 file_id = message.video.file_id
+                file_type = 'video'
+            elif message.document:
+                file_id = message.document.file_id
+                file_type = 'document'
+            elif message.audio:
+                file_id = message.audio.file_id
+                file_type = 'audio'
 
             # Для медиагрупп сохраняем caption только из первого сообщения
             caption = None
@@ -302,38 +312,78 @@ async def process_pending_posts(app: Application):
                         text=full_caption
                     )
                 # Одиночное медиа
+                # Одиночное медиа
                 elif len(all_file_ids) == 1:
-                    file_id = all_file_ids[0]
-                    if file_id.startswith('AgAC'):
-                        msg = await bot.send_photo(
-                            chat_id=TARGET_CHANNEL_ID,
-                            photo=file_id,
-                            caption=full_caption,
-                            parse_mode="Markdown"
-                        )
+                    msg = None  # Инициализируем переменную
+                    try:
+                        file_id = all_file_ids[0]
+                        if file_id.startswith('AgAC'):  # Фото
+                            msg = await bot.send_photo(
+                                chat_id=TARGET_CHANNEL_ID,
+                                photo=file_id,
+                                caption=full_caption,
+                                parse_mode="Markdown"
+                            )
+                        elif file_id.startswith('BAAC'):  # Видео
+                            msg = await bot.send_video(
+                                chat_id=TARGET_CHANNEL_ID,
+                                video=file_id,
+                                caption=full_caption,
+                                parse_mode="Markdown"
+                            )
+                        elif file_id.startswith('BQAC'):  # Документы
+                            msg = await bot.send_document(
+                                chat_id=TARGET_CHANNEL_ID,
+                                document=file_id,
+                                caption=full_caption,
+                                parse_mode="Markdown"
+                            )
+                        elif file_id.startswith('CQAC'):  # Аудио
+                            msg = await bot.send_audio(
+                                chat_id=TARGET_CHANNEL_ID,
+                                audio=file_id,
+                                caption=full_caption,
+                                parse_mode="Markdown"
+                            )
+
+                        if msg:
+                            PostManager.mark_as_processed(media_group_id, msg.message_id)
+                            logger.info(f"Пост {media_group_id} успешно переслан")
+                        else:
+                            logger.warning(f"Не удалось отправить файл {file_id[:10]}...")
+
+                    except Exception as e:
+                        file_id = all_file_ids[0]
+                        logger.error(f"Ошибка отправки файла {file_id[:10] if file_id else 'unknown'}: {e}")
+
                 # Медиагруппа
                 else:
                     media_group = []
                     for i, file_id in enumerate(all_file_ids):
-                        if file_id.startswith('AgAC'):
+                        if file_id.startswith('AgAC'):  # Фото
                             media = InputMediaPhoto(
                                 media=file_id,
                                 caption=full_caption if i == 0 else None,
                                 parse_mode="Markdown"
                             )
-                        elif file_id.startswith('BAAC'):
+                        elif file_id.startswith('BAAC'):  # Видео
                             media = InputMediaVideo(
                                 media=file_id,
                                 caption=full_caption if i == 0 else None,
                                 parse_mode="Markdown"
                             )
+                        elif file_id.startswith('BQAC'):  # Документы
+                            media = InputMediaDocument(
+                                media=file_id,
+                                caption=full_caption if i == 0 else None,
+                                parse_mode="Markdown"
+                            )
                         else:
-                            continue
+                            continue  # Пропускаем аудио и неизвестные типы
 
                         media_group.append(media)
 
                     if media_group:
-                        logger.info(f"Отправка медиагруппы из {len(media_group)} элементов с текстом: '{full_caption}'")
                         try:
                             messages = await bot.send_media_group(
                                 chat_id=TARGET_CHANNEL_ID,
@@ -342,11 +392,16 @@ async def process_pending_posts(app: Application):
                             msg = messages[0] if messages else None
                         except Exception as e:
                             logger.error(f"Ошибка отправки медиагруппы: {e}")
-                            continue
 
                 if msg:
-                    for post in posts:
-                        PostManager.mark_as_processed(post['media_group_id'], msg.message_id)
+                    try:
+                        if 'msg' in locals():
+                            PostManager.mark_as_processed(media_group_id, msg.message_id)
+                            logger.info(f"Пост {media_group_id} успешно переслан")
+                        else:
+                            logger.error("Сообщение не было отправлено")
+                    except Exception as e:
+                        logger.error(f"Ошибка при пометке поста: {e}")
                     logger.info(f"Группа {media_group_id} успешно переслана")
                 else:
                     logger.error(f"Не удалось отправить группу {media_group_id}")
@@ -356,7 +411,6 @@ async def process_pending_posts(app: Application):
 
     except Exception as e:
         logger.error(f"Ошибка process_pending_posts: {e}")
-
 
 
 async def run_bot():
