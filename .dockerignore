@@ -1,0 +1,16 @@
+# Системное
+.idea/
+.venv/
+__pycache__/
+*.pyc
+
+# Git
+.gitignore
+README.md
+
+# Примеры (не копируем)
+*.example
+example.*
+
+# Конфиги и данные
+data/
