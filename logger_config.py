@@ -1,6 +1,12 @@
 import logging
 from logging.handlers import RotatingFileHandler
 import time
+from pathlib import Path
+
+
+# Настройка data
+log_path = Path("data") / "bot.log"
+log_path.parent.mkdir(exist_ok=True)
 
 
 def setup_logging():
@@ -13,7 +19,7 @@ def setup_logging():
 
     # Файловый обработчик (основные логи)
     file_handler = RotatingFileHandler(
-        'bot.log',
+        log_path,
         maxBytes=5*1024*1024,  # 5 MB
         backupCount=3,
         encoding='utf-8'

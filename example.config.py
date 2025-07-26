@@ -11,6 +11,3 @@ KEYWORDS = [
     "мужч",
     "унисекс"
 ]
-
-# Уровень логирования ('DEBUG', 'INFO', 'WARNING', 'ERROR')
-LOG_LEVEL = 'INFO'

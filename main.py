@@ -12,6 +12,12 @@ import sqlite3
 import json
 from config import DELAY_MINUTES, ADDITIONAL_TEXT, KEYWORDS, CHECK_INTERVAL
 import pytz
+from pathlib import Path
+
+
+# Настройка data
+db_path = Path("data") / "posts.db"
+db_path.parent.mkdir(exist_ok=True)
 
 # Настройка логирования
 setup_logging()
@@ -26,7 +32,7 @@ TARGET_CHANNEL_ID = int(os.getenv("TARGET_CHANNEL_ID"))
 
 # Инициализация базы данных
 def init_db():
-    conn = sqlite3.connect('posts.db')
+    conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS posts (
@@ -52,7 +58,7 @@ class PostManager:
     def debug_unprocessed_posts():
         """Экстренная проверка необработанных постов"""
         try:
-            conn = sqlite3.connect('posts.db')
+            conn = sqlite3.connect(db_path)
             cursor = conn.cursor()
 
             cursor.execute('''
@@ -74,7 +80,7 @@ class PostManager:
     @staticmethod
     def _get_connection():
         """Возвращает безопасное подключение к БД"""
-        conn = sqlite3.connect('posts.db')
+        conn = sqlite3.connect(db_path)
         conn.execute("PRAGMA journal_mode=WAL")  # Улучшенная производительность
         conn.execute("PRAGMA foreign_keys=ON")   # Включить внешние ключи
         return conn
@@ -83,7 +89,7 @@ class PostManager:
     def clear_db():
         """Очищает базу данных (только для тестов!)"""
         try:
-            conn = sqlite3.connect('posts.db')
+            conn = sqlite3.connect(db_path)
             cursor = conn.cursor()
             cursor.execute('DELETE FROM posts')
             conn.commit()
@@ -99,7 +105,7 @@ class PostManager:
         """Сохраняет пост в базу данных"""
         conn = None
         try:
-            conn = sqlite3.connect('posts.db')
+            conn = sqlite3.connect(db_path)
             cursor = conn.cursor()
 
             media_group_id = message.media_group_id or str(message.message_id)
@@ -531,7 +537,7 @@ async def run_periodic_check(app: Application):
 def check_media_groups():
     """Проверяет целостность медиагрупп в базе"""
     try:
-        conn = sqlite3.connect('posts.db')
+        conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
 
         cursor.execute('''
